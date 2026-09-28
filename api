@@ -1,0 +1,300 @@
+# api/index.py
+# --------------------------------------------------------------
+# MemoryDesk – single‑file FastAPI app for Vercel
+# --------------------------------------------------------------
+import os
+import asyncio
+from typing import List, Dict
+from fastapi import FastAPI, APIRouter, Request
+from fastapi.responses import HTMLResponse, Response, JSONResponse
+from pydantic import BaseModel
+
+# --------------------------------------------------------------
+# Load .env locally (optional – Vercel uses its own env vars)
+# --------------------------------------------------------------
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# --------------------------------------------------------------
+# Optional Hindsight client – falls back to in‑memory dict
+# --------------------------------------------------------------
+try:
+    from hindsight import HindsightClient      # <-- real client if you have it
+except Exception:   # pragma: no cover
+    HindsightClient = None
+
+class MemoryManager:
+    """Per‑customer memory (Hindsight if available, else in‑memory)."""
+    def __init__(self):
+        self.client = HindsightClient() if HindsightClient else None
+        self._fallback: Dict[str, List[str]] = {}
+
+    async def _run(self, fn, *a, **kw):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: fn(*a, **kw))
+
+    async def retrieve(self, cust_id: str, query: str) -> List[str]:
+        if self.client:
+            try:
+                res = await self._run(
+                    self.client.search, collection=cust_id, query=query, top_k=5
+                )
+                return [r["content"] for r in res]
+            except Exception as e:
+                print("[Memory] Hindsight error:", e)
+                return []
+        # fallback – simple substring search
+        store = self._fallback.get(cust_id, [])
+        return [m for m in store if query.lower() in m.lower()][:5]
+
+    async def store(self, cust_id: str, user_msg: str, agent_resp: str):
+        entry = f"User: {user_msg}\nAgent: {agent_resp}"
+        if self.client:
+            try:
+                await self._run(
+                    self.client.upsert,
+                    collection=cust_id,
+                    documents=[{"content": entry}],
+                )
+            except Exception as e:
+                print("[Memory] store error:", e)
+        else:
+            self._fallback.setdefault(cust_id, []).append(entry)
+
+    async def count(self, cust_id: str) -> int:
+        if self.client:
+            try:
+                meta = await self._run(self.client.get_collection_meta, name=cust_id)
+                return meta.get("doc_count", 0)
+            except Exception as e:
+                print("[Memory] count error:", e)
+                return 0
+        return len(self._fallback.get(cust_id, []))
+
+
+# --------------------------------------------------------------
+# Groq LLM wrapper (OpenAI‑compatible)
+# --------------------------------------------------------------
+try:
+    import groq
+except Exception:   # pragma: no cover
+    groq = None
+
+async def generate_response(customer_id: str, user_msg: str,
+                            session_hist: List[Dict[str, str]],
+                            memories: List[str]) -> str:
+    """Build prompt + call Groq (or return a mock)."""
+    parts = []
+    if memories:
+        parts.append("Relevant prior incidents:")
+        parts.extend(f"- {m}" for m in memories)
+    parts.append(f"Customer ({customer_id}) says: {user_msg}")
+    prompt = "\n".join(parts)
+
+    if groq:
+        try:
+            client = groq.Groq(api_key=os.getenv("GROQ_API_KEY"))
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: client.chat.completions.create(
+                    model=os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile"),
+                    messages=[
+                        {"role": "system", "content": "You are a helpful support agent."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.7,
+                ),
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            print("[LLM] Groq error:", e)
+
+    # mock fallback
+    return f"[Mock] Received: {user_msg}"
+
+
+# --------------------------------------------------------------
+# FastAPI app (all routes in one file)
+# --------------------------------------------------------------
+app = FastAPI(title="MemoryDesk (Vercel)")
+router = APIRouter()
+mem_manager = MemoryManager()
+
+# ---------- request/response models ----------
+class ChatMessage(BaseModel):
+    customer_id: str
+    content: str
+    use_memory: bool = True
+
+class ChatResponse(BaseModel):
+    response: str
+    retrieved_memories: List[str] = []
+    memory_count: int = 0
+
+# ---------- API endpoint ----------
+@router.post("/api/chat", response_model=ChatResponse)
+async def chat_endpoint(msg: ChatMessage):
+    memories = [] if not msg.use_memory else await mem_manager.retrieve(
+        msg.customer_id, msg.content
+    )
+    resp_text = await generate_response(
+        customer_id=msg.customer_id,
+        user_msg=msg.content,
+        session_hist=[],          # not persisted in this minimal version
+        memories=memories,
+    )
+    # fire‑and‑forget store
+    asyncio.create_task(
+        mem_manager.store(msg.customer_id, msg.content, resp_text)
+    )
+    cnt = await mem_manager.count(msg.customer_id)
+    return ChatResponse(
+        response=resp_text,
+        retrieved_memories=memories,
+        memory_count=cnt,
+    )
+
+app.include_router(router)
+
+# --------------------------------------------------------------
+# Embedded front‑end (HTML / CSS / JS) – served at "/"
+# --------------------------------------------------------------
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>MemoryDesk</title>
+<link rel="stylesheet" href="/static/style.css"></head>
+<body>
+<h1>MemoryDesk – AI Support Agent</h1>
+<div class="controls">
+  <label for="customerSelect">Customer:</label>
+  <select id="customerSelect">
+    <option value="cust_001">Customer 001</option>
+    <option value="cust_002">Customer 002</option>
+    <option value="cust_003">Customer 003</option>
+  </select>
+  <label class="switch"><input type="checkbox" id="memoryToggle" checked>
+    <span class="slider"></span></label>
+  <span>Memory ON</span>
+  <button id="resetBtn">Reset Session</button>
+  <span id="status" class="status-indicator">🟢 Ready</span>
+</div>
+<div class="chat">
+  <div id="conversation" class="conversation"></div>
+  <textarea id="userInput" placeholder="Enter support message..." rows="3"></textarea>
+  <button id="sendBtn">Send</button>
+</div>
+<div class="memory-panel"><h2>Retrieved Memories (<span id="memCount">0</span>)</h2>
+  <ul id="memList"></ul></div>
+<script src="/static/script.js"></script>
+</body></html>"""
+
+CSS_CONTENT = """body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}
+h1{text-align:center}
+.controls{display:flex;align-items:center;gap:10px;margin-bottom:15px;flex-wrap:wrap;justify-content:center}
+.chat{display:flex;flex-direction:column;max-width:800px;margin:auto;background:#fff;padding:10px;border-radius:5px;box-shadow:0 2px 4px rgba(0,0,0,.1)}
+.conversation{flex-grow:1;min-height:200px;max-height:400px;overflow-y:auto;margin-bottom:10px;border:1px solid #ddd;padding:8px;border-radius:4px;background:#fafafa}
+.message{margin:4px 0}
+.message.user{color:#2b6cb0;font-weight:bold}
+.message.agent{color:#2f855a;font-weight:bold}
+textarea{width:100%;resize:vertical;padding:6px;border-radius:4px;border:1px solid #ccc;font-family:inherit;margin-bottom:8px}
+button{padding:6px 12px;border:none;border-radius:4px;background:#3182ce;color:#fff;cursor:pointer}
+button:hover{background:#2b6cb0}
+.memory-panel{max-width:800px;margin:20px auto;background:#fff;padding:10px;border-radius:5px;box-shadow:0 2px 4px rgba(0,0,0,.1)}
+.memory-panel ul{list-style:disc;padding-left:20px}
+.status-indicator{font-weight:bold}
+/* toggle switch */
+.switch{position:relative;display:inline-block;width:40px;height:22px}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#ccc;transition:.4s;border-radius:22px}
+.slider:before{position:absolute;content:"";height:16px;width:16px;left:3px;bottom:3px;background:#fff;transition:.4s;border-radius:50%}
+input:checked+.slider{background:#48bb78}
+input:checked+.slider:before{transform:translateX(18px)}"""
+
+JS_CONTENT = """document.addEventListener('DOMContentLoaded', () => {
+  const custSel = document.getElementById('customerSelect');
+  const memToggle = document.getElementById('memoryToggle');
+  const sendBtn = document.getElementById('sendBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const userInp = document.getElementById('userInput');
+  const convDiv = document.getElementById('conversation');
+  const memList = document.getElementById('memList');
+  const memCnt = document.getElementById('memCount');
+  const status = document.getElementById('status');
+
+  const setStatus = (txt, emoji='🟢') => status.textContent = `${emoji} ${txt}`;
+  const addMsg = (role, txt) => {
+    const el = document.createElement('div');
+    el.className = `message ${role}`;
+    el.textContent = `${role==='user'?'You':'Agent'}: ${txt}`;
+    convDiv.appendChild(el);
+    convDiv.scrollTop = convDiv.scrollHeight;
+  };
+  const clearChat = () => {
+    convDiv.innerHTML = '';
+    memList.innerHTML = '';
+    memCnt.textContent = '0';
+    setStatus('Ready');
+  };
+  resetBtn.onclick = clearChat;
+
+  sendBtn.onclick = async () => {
+    const msg = userInp.value.trim();
+    if (!msg) return;
+    const cust = custSel.value;
+    const useMem = memToggle.checked;
+    addMsg('user', msg);
+    userInp.value = '';
+    setStatus('Waiting…', '⏳');
+    try {
+      const r = await fetch('/api/chat', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({customer_id:cust, content:msg, use_memory:useMem})
+      });
+      if (!r.ok) throw new Error('Network error');
+      const data = await r.json();
+      addMsg('agent', data.response);
+      memList.innerHTML = '';
+      data.retrieved_memories.forEach(m => {
+        const li = document.createElement('li'); li.textContent=m; memList.appendChild(li);
+      });
+      memCnt.textContent = data.memory_count ?? data.retrieved_memories.length;
+      setStatus('Ready');
+    } catch (e) {
+      console.error(e);
+      addMsg('agent', 'Error – could not get a response.');
+      setStatus('Error', '🔴');
+    }
+  };
+});"""
+
+# ----- static routes for embedded assets -----
+static = APIRouter()
+
+
+@static.get("/static/style.css")
+async def css():
+    return Response(content=CSS_CONTENT, media_type="text/css")
+
+
+@static.get("/static/script.js")
+async def js():
+    return Response(content=JS_CONTENT, media_type="application/javascript")
+
+
+app.include_router(static)
+
+# ----- root page -----
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return HTMLResponse(content=HTML_PAGE)
+
+
+# --------------------------------------------------------------
+# Vercel entry‑point (the file name is index.py, Vercel calls `handler`)
+# --------------------------------------------------------------
+def handler(request: Request):
+    """Vercel uses this as the entry point for Python functions."""
+    return app(request.scope, request.receive, request.send)
