@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env               # keep your local .env out of the repo
+.venv/
+dist/
+build/
+*.egg-info/
