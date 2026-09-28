@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+groq
+# If you have Hindsight, add it here, e.g.:
+# hindsight @ git+https://github.com/yourorg/hindsight.git#egg=hindsight
